@@ -108,6 +108,9 @@ From highest to lowest priority:
 
 All prices are compared in c/kWh, after VAT (if enabled) and tariff are added.
 
+When both are set, the max price must be lower than the roof price. Otherwise the settings aren't
+saved.
+
 ### Cheapest hours
 
 Enter the number of hours you need, e.g. `4` or `2.75`, and a window, e.g. `22 – 07`. The device
@@ -156,7 +159,7 @@ All settings are stored in flash and survive reboots and firmware updates.
 
 ```json
 {
-  "version": "0.96",
+  "version": "0.97",
   "area": "FI",
   "currency": "EUR",
   "vatEnabled": true,

@@ -47,7 +47,7 @@
 
 // ======================== CONFIGURATION ========================
 
-#define FW_VERSION       "0.96"
+#define FW_VERSION       "0.97"
 #define FW_BUILD_DATE    __DATE__ " " __TIME__
 
 #define RELAY_PIN        14       // GPIO for transistor base
@@ -1082,8 +1082,32 @@ void handleSettings() {
   sendSettingsPageChunked();
 }
 
+// Max price must be below roof price, otherwise the roof silently blocks what max price allows.
+// Sends an error page and returns false if the submitted values conflict (nothing is saved).
+bool validatePriceLimits() {
+  String stopVal = server.arg("price_stop");
+  String roofVal = server.arg("price_roof");
+  if (stopVal.length() == 0 || roofVal.length() == 0) return true;
+  if (stopVal.toFloat() < roofVal.toFloat()) return true;
+
+  char html[640];
+  snprintf(html, sizeof(html),
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px;"
+    "background:#1a1a2e;color:#e0e0e0;text-align:center;}"
+    "h2{color:#ff4444;}a{color:#00d4aa}</style></head><body>"
+    "<h2>&#10008; Not saved</h2>"
+    "<p>Max price (%.1f) must be lower than roof price (%.1f).</p>"
+    "<p><a href='javascript:history.back()'>Back</a></p></body></html>",
+    stopVal.toFloat(), roofVal.toFloat());
+  server.send(400, "text/html", html);
+  return false;
+}
+
 void handleSaveQuick() {
   // Quick save from dashboard: max price + force charge window
+  if (!validatePriceLimits()) return;
   String stopVal = server.arg("price_stop");
   String fcStartVal = server.arg("fc_start");
   String fcEndVal = server.arg("fc_end");
@@ -1134,6 +1158,7 @@ void handleOverride() {
 }
 
 void handleSaveSettings() {
+  if (!validatePriceLimits()) return;
   String stopVal = server.arg("price_stop");
   String fcStartVal = server.arg("fc_start");
   String fcEndVal = server.arg("fc_end");
@@ -1766,7 +1791,8 @@ void sendMainPageChunked() {
   
   server.sendContent_P(PSTR(
     "</div>"
-    "<form action=\"/savequick\" method=\"POST\"><div class=\"ctrl-card\"><div class=\"ctrl-row\">"
+    "<form action=\"/savequick\" method=\"POST\" onsubmit=\"return checkLimits(this)\">"
+    "<div class=\"ctrl-card\"><div class=\"ctrl-row\">"
     "<div class=\"ctrl-item\"><label>Max price ("
   ));
   
@@ -1829,7 +1855,11 @@ void sendMainPageChunked() {
     "</div></form>"
     "<div class=\"links\"><a href=\"/settings\">&#9881; Settings</a>"
     "<a href=\"/api/prices\">&#128203; API</a></div></div>"
-    "<script>const prices=["
+    "<script>"
+    "function checkLimits(f){const s=f.price_stop.value,r=f.price_roof.value;"
+    "if(s!==''&&r!==''&&parseFloat(s)>=parseFloat(r)){"
+    "alert('Max price must be lower than roof price.');return false;}return true;}"
+    "const prices=["
   ));
   
   // --- Price data: sent entry by entry, zero allocation ---
@@ -2065,7 +2095,7 @@ void sendSettingsPageChunked() {
      "Firmware v%s | Built %s</div>", FW_VERSION, FW_BUILD_DATE);
   
   server.sendContent_P(PSTR(
-    "<form action=\"/savesettings\" method=\"POST\">"
+    "<form action=\"/savesettings\" method=\"POST\" onsubmit=\"return checkLimits(this)\">"
     "<div class=\"card\"><h3>&#128246; WiFi Connection</h3>"
     "<div class=\"current-val\">Connected to: "
   ));
@@ -2268,7 +2298,11 @@ void sendSettingsPageChunked() {
     "'Reset ALL settings and reboot? WiFi, area, thresholds - everything will be cleared.')\">"
     "<button type=\"submit\" class=\"btn btn-danger\">&#128465; Factory Reset</button></form>"
     "<a href=\"/\" class=\"back\">&#8592; Back to Dashboard</a></div>"
-    "<script>document.getElementById('area').value='"
+    "<script>"
+    "function checkLimits(f){const s=f.price_stop.value,r=f.price_roof.value;"
+    "if(s!==''&&r!==''&&parseFloat(s)>=parseFloat(r)){"
+    "alert('Max price must be lower than roof price.');return false;}return true;}"
+    "document.getElementById('area').value='"
   ));
   
   server.sendContent(priceArea);
