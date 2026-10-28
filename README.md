@@ -1,354 +1,209 @@
-# ESP32 Nord Pool Smart Charger Controller
+# NordPool Charger
 
-An ESP32-based smart charger controller that uses real-time Nord Pool electricity spot prices to control a dry contact relay. Charges your EV (or any device) when electricity is cheap and stops when it's expensive.
+ESP32 firmware that turns EV charging (or any load with an enable input) on and off based on
+Nord Pool day-ahead electricity prices. It drives a relay as a dry contact, so it works with any
+charger or device that has a "charging allowed" / external enable input.
 
-![Firmware](https://img.shields.io/badge/firmware-v0.93-brightgreen) ![Platform](https://img.shields.io/badge/platform-ESP32-blue) ![License](https://img.shields.io/badge/license-MIT-orange)
+Everything is configured from a built-in web page. No cloud service, app or account is needed.
 
 ## Features
 
-**Core functionality**
-- Real-time electricity prices from the free Nord Pool dataportal API (no API key needed)
-- Dry contact relay control based on configurable price threshold
-- Today + tomorrow prices (next-day prices fetched automatically after 14:00)
-- 15-minute price resolution for Finland, hourly for other areas
-- Fail-safe design: power loss → relay de-energizes → NC closes → charging stays ON
-
-**User interface**
-- Dark-themed responsive web dashboard with interactive price chart
-- Tap/hover tooltips showing price, time, and charging status per bar
-- Color-coded bars: green (charging), red (stopped), blue (forced ON), white (current period)
-- Quick controls on dashboard for max price and always-allowed hours
-- Manual override button: force charging ON for 30min – 12 hours
-- Full settings page with WiFi, timezone, area, currency, VAT, tariff configuration
-
-**Smart features**
-- Always-allowed charging hours (e.g., 02:00–07:00 overnight, overrides price)
-- Electricity company tariff/margin added on top of spot price
-- Automatic VAT per country (Finland 25.5%, Sweden 25%, etc.)
-- Configurable timezone with auto-detection from price area
-- Custom mDNS hostname (e.g., `http://mycharger.local`)
-- WiFi auto-reconnect with AP fallback after 2 minutes
-- OTA firmware updates via web browser (no USB needed after first flash)
-- REST API endpoint (`/api/prices`) for Home Assistant or other integrations
-
-**Stability**
-- Zero heap-allocation page rendering (PROGMEM + chunked HTTP)
-- JSON deserialization filter (parses only selected area, ~90% memory savings)
-- Price data preserved on fetch failure (restores previous data)
-- Fetch-in-progress detection (serves lightweight "loading" page during HTTPS)
-- Consistent page rendering via global state snapshots (no race conditions)
+- **Live price chart** for today and tomorrow (15-minute or hourly slots, depending on the area)
+- **Max price**: charge only when the price is at or below a limit
+- **Cheapest hours**: charge only during the N cheapest hours within a time window,
+  e.g. "4 cheapest hours between 22:00 and 07:00"
+- **Roof price**: never charge above this price, whatever the other rules say
+- **Always allowed hours**: a daily time window when charging is always on
+- **Manual override**: force charging on for 0.5–12 hours with one button
+- **Fail-safe**: if the ESP32 loses power, or prices can't be fetched, charging stays **on**
+- **VAT and tariff**: prices include VAT for the selected area and an optional fixed
+  margin/transfer fee
+- **21 price areas**: FI, SE1–4, DK1–2, NO1–5, EE, LV, LT, AT, BE, DE-LU, FR, NL, PL
+- **WiFi setup portal**: on first boot the device opens its own access point for setup
+- **mDNS**: open `http://charger.local` (configurable name)
+- **Firmware update over WiFi** from the settings page
+- **JSON API** at `/api/prices` for Home Assistant, scripts, etc.
 
 ## Hardware
 
-### Components
-
-| Component | Example | Notes |
-|-----------|---------|-------|
-| ESP32 Dev Board | ESP32-WROOM-32 DevKit | Any ESP32 with WiFi |
-| Relay Module | Songle SRD-05VDC-SL-C | 5V module with built-in driver |
-| Jumper Wires | 3 pcs | ESP32 → relay module |
-| Wire | 2 pcs | Relay screw terminals → charger dry contact |
-
-No external transistors, resistors, or diodes needed when using a relay module.
-
-### Wiring — Relay Module (Recommended)
+- ESP32 or ESP32-S3 dev board (developed on an ESP32-S3-WROOM-1 with 8 MB flash)
+- Relay module with a **normally closed (NC)** contact, or a bare relay driven by a transistor:
 
 ```
-    Relay Module              ESP32
-   ┌───────────┐
-   │  IN ──────────────────── GPIO 26
-   │  GND ─────────────────── GND
-   │  VCC ─────────────────── 5V (or VIN)
-   │           │
-   │  COM ─────┤──── wire ──── Charger Enable +
-   │  NC  ─────┤──── wire ──── Charger Enable -
-   │  NO  (not used)
-   └───────────┘
+GPIO 14 ──[1 kΩ]──┤ B   NPN (e.g. 2N2222)
+                  │ C ──── relay coil ──── VCC (relay voltage)
+                  │ E ──── GND             (flyback diode across the coil)
+
+Relay COM + NC  ──>  charger's enable / "charging allowed" input
 ```
 
-**Important:** Wire between **COM** and **NC** (Normally Closed) for fail-safe operation.
+| GPIO 14 | Relay        | NC contact | Charging |
+|---------|--------------|------------|----------|
+| LOW     | not energized| closed     | **ON**   |
+| HIGH    | energized    | open       | OFF      |
+| no power| not energized| closed     | **ON**   |
 
-### Why NC (Normally Closed)?
+Wiring the NC contact means a dead or rebooting ESP32 never blocks charging.
 
-| ESP32 State | Relay | NC Contact | Charging |
-|-------------|-------|------------|----------|
-| Power lost | De-energized | **Closed** | **ON** ✓ |
-| Running, cheap price | De-energized | **Closed** | **ON** ✓ |
-| Running, expensive | Energized | **Open** | **OFF** ✗ |
+The relay pin is set with `RELAY_PIN` near the top of the sketch. The status LED uses `LED_PIN`
+(GPIO 2): it blinks fast in setup mode and stays on while running. Many ESP32-S3 boards have an
+RGB LED instead, so the LED may not light on those. This doesn't affect anything else.
 
-### Wiring — Bare Transistor (Alternative)
+> ⚠️ Only switch the charger's low-voltage control input with this relay, never mains power to the
+> charger. Check your charger's manual for how its external enable input works.
 
-For direct relay control without a module:
+## Building
 
-```
-                    +5V
-                      │
-                 ┌────┴────┐
-                 │  RELAY   │
-                 │   COIL   │
-                 └────┬────┘
-             ┌────┐   │
-    Diode    │ ◄──┼───┤      COM ─── To Charger
-  (1N4007)   │    │   │      NC  ─── To Charger
-             └────┼───┘
-                  │ (Collector)
-              ┌───┴───┐
-              │  NPN  │  (2N2222 / BC547)
-              └───┬───┘
-                  │ (Base)
-    GPIO 26 ──[1kΩ]──┘
-                  │ (Emitter)
-                 GND
-```
+1. Install the [Arduino IDE](https://www.arduino.cc/en/software) and the **esp32** board package by
+   Espressif (Boards Manager). Tested with esp32 core 3.3.x.
+2. Install the **ArduinoJson** library by Benoit Blanchon (Library Manager, version 7.x).
+3. Open `nordpool_charger/nordpool_charger.ino`.
+4. Select your board under **Tools**, for example for an ESP32-S3 with 8 MB flash:
 
-### Active LOW Relay Modules
+   | Setting          | Value                                   |
+   |------------------|-----------------------------------------|
+   | Board            | ESP32S3 Dev Module                      |
+   | Flash Size       | 8MB (64Mb)                              |
+   | Partition Scheme | 8M with spiffs (3MB APP/1.5MB SPIFFS)   |
 
-Most relay modules are active LOW (relay clicks when IN = LOW). If your relay behaves opposite to expected, swap `HIGH`/`LOW` in the `digitalWrite(RELAY_PIN, ...)` calls in `updateRelay()`.
+   For a classic ESP32, pick **ESP32 Dev Module** and a partition scheme with OTA.
+   The firmware is about 1.2 MB, so it fits the default 4 MB layout.
+5. Upload over USB the first time.
 
-## Getting Started
+A binary built for one chip doesn't run on another: an ESP32 build won't work on an ESP32-S3.
+A change of **Partition Scheme** always needs a USB upload. Firmware updates over WiFi only
+replace the firmware, not the flash layout.
 
-### Prerequisites
+## First setup
 
-1. **Arduino IDE 2.x** or **PlatformIO**
-2. **ESP32 Board Package** — add `https://dl.espressif.com/dl/package_esp32_index.json` to Board Manager URLs
-3. **ArduinoJson** library v7+ — install via Library Manager
+1. Power on the device. It opens a WiFi network called **`NordPool-Charger`** (no password).
+2. Connect to it with your phone. The setup page should open by itself; if not, go to
+   `http://192.168.4.1`.
+3. Pick your WiFi network, enter the password, choose your price area and press
+   **Save & Connect**.
+4. The device reboots and joins your WiFi. Open **`http://charger.local`**, or use the IP address
+   shown by your router.
 
-### First Flash
+If the device loses WiFi for more than 2 minutes, it opens the setup network again, so you can
+reconfigure it.
 
-1. Open `nordpool_charger.ino` in Arduino IDE
-2. Select board: **ESP32 Dev Module**
-3. Upload to ESP32 via USB
-4. Connect to WiFi hotspot **NordPool-Charger** (open network)
-5. Captive portal opens → select your WiFi, set price area
-6. ESP32 reboots → visit **http://charger.local**
+## Using it
 
-### Subsequent Updates (OTA)
+The dashboard shows the relay status, the current price, today's min/max and the price chart.
+Green bars are slots where it charges, red where it doesn't, blue the always-allowed hours and dark
+red the slots above the roof price. Tap or hover a bar for details.
 
-1. Arduino IDE: **Sketch → Export Compiled Binary**
-2. Open **Settings** page on the charger
-3. Scroll to **Firmware Update**, select the `.bin` file
-4. Click **Upload & Update** — device reboots with new firmware
-5. All settings are preserved (stored in flash, separate from firmware)
+### Charging rules
 
-## Web Interface
+From highest to lowest priority:
 
-### Dashboard
+1. **Manual override**: charges for the selected time, even above the roof price.
+2. **No prices loaded**: charges (fail-safe).
+3. **Roof price**: never charges above it.
+4. **Always allowed hours**: charges during this daily window.
+5. **Cheapest hours** (when set): charges only in the selected cheapest slots of the window.
+   If a max price is also set, it also charges whenever the price is at or below it.
+6. **Max price** (when set): charges when the price is at or below it.
+7. **Nothing set**: always charges.
 
-The main page shows:
-- **Relay status** — CHARGING ON / CHARGING OFF / OVERRIDE ON / LOADING PRICES
-- **Current price** with today's min and max
-- **Price chart** — interactive bar chart with today + tomorrow
-- **Manual override** — force charging ON for a selected duration
-- **Quick controls** — max price and always-allowed hours
+All prices are compared in c/kWh, after VAT (if enabled) and tariff are added.
 
-The page auto-refreshes every 60 seconds. During price fetches, a lightweight "Fetching prices..." page is shown to avoid slow responses.
+### Cheapest hours
 
-### Settings
+Enter the number of hours you need, e.g. `4` or `2.75`, and a window, e.g. `22 – 07`. The device
+picks the cheapest slots inside the window. They don't have to be consecutive. Leave the hours
+empty to turn the mode off. If start and end are the same hour, the window is 24 hours.
 
-- **WiFi** — change SSID/password (reboots to apply)
-- **Device Name** — custom mDNS hostname
-- **Price Area** — delivery area with automatic VAT rate
-- **Timezone** — auto-set from area, manual override available
-- **Currency** — EUR, SEK, NOK, DKK
-- **VAT** — toggle on/off, rate auto-detected per country
-- **Tariff** — electricity company margin added to spot price
-- **Price Threshold** — max price for charging
-- **Always Allowed Hours** — time window that overrides price threshold
-- **Firmware Update** — upload `.bin` via browser
-- **Reboot / Factory Reset**
+- To estimate the hours, divide the energy needed (kWh) by the charging power (kW), and add a
+  little extra.
+- Nord Pool publishes next-day prices in the early afternoon, and the device starts checking for
+  them at 14:00 local time. Start the window after about 15:00, so the whole window is priced when
+  the plan is made. Until then the dashboard shows "waiting for next-day prices".
+- With a roof price, slots above the roof are skipped. If too few slots are left, you get fewer
+  hours, and the dashboard shows e.g. "only 3h below roof".
+- After a reboot in the middle of a window, the device plans the full hours again from that moment
+  on, so it may charge a bit more than requested, never less.
 
-Version number and build date shown at top of settings page.
+### Price updates
 
-## Charging Logic
+Prices are fetched every 15 minutes, every 5 minutes between 14:00 and 16:00 until tomorrow's
+prices appear, and every 60 seconds if no prices are loaded yet.
 
-Priority order (highest to lowest):
+## Settings page
 
-| Priority | Condition | Result |
-|----------|-----------|--------|
-| 1 | Manual override active | Charging ON |
-| 2 | Current time in always-allowed window | Charging ON |
-| 3 | Current price ≤ max price threshold | Charging ON |
-| 3 | Current price > max price threshold | Charging OFF |
-| 4 | No threshold set | Charging ON |
+`http://charger.local/settings` contains:
 
-### Examples
+- WiFi network and device name (mDNS). Changing either reboots the device.
+- Price area, currency and VAT on/off
+- Timezone (set automatically from the price area)
+- Tariff / margin in c/kWh, added on top of the spot price
+- Max price, roof price, always allowed hours and cheapest hours
+- Firmware update, reboot and factory reset
 
-| Max Price | Always Allowed | Override | Behavior |
-|-----------|---------------|----------|----------|
-| Not set | Off | Off | Always charges |
-| 8.0 c/kWh | Off | Off | Charges when price ≤ 8.0 |
-| 8.0 c/kWh | 02:00–07:00 | Off | Price-based, but always charges 02–07 |
-| 8.0 c/kWh | 02:00–07:00 | 2h | Charges next 2 hours regardless |
+All settings are stored in flash and survive reboots and firmware updates.
 
-## Next-Day Prices
+## Firmware update over WiFi
 
-Nord Pool publishes next-day prices between 14:00–14:45 CET (~15:00–15:45 Finnish time).
+1. In the Arduino IDE: **Sketch → Export Compiled Binary**, using the same Tools settings as the
+   USB upload.
+2. Open **Settings → Firmware Update**, choose the `.bin` file from the sketch's `build/` folder
+   and upload.
+3. The device reboots. The settings page shows the new firmware version.
 
-The device:
-- Checks every **5 minutes** between 14:00–16:00 local time
-- Once found, tomorrow's prices appear on the chart with dimmer colors
-- Dashed separator line marks the boundary between today and tomorrow
-- Switches to **15-minute** intervals after tomorrow is loaded
-- Resets at midnight for the new day
+## JSON API
 
-## Price Calculation
-
-```
-Display price = (API price in EUR/MWh ÷ 10) × (1 + VAT%) + tariff
-
-Example (Finland):
-  50.00 EUR/MWh ÷ 10 × 1.255 + 0.41 = 6.685 c/kWh
-```
-
-### VAT Rates
-
-| Country | Rate | Local Name |
-|---------|------|------------|
-| **Finland** | **25.5%** | ALV |
-| Sweden, Norway, Denmark | 25% | Moms / MVA |
-| Estonia | 22% | KM |
-| Latvia, Lithuania | 21% | PVN / PVM |
-| Austria, France | 20% | MwSt / TVA |
-| Germany | 19% | MwSt |
-| Belgium, Netherlands | 21% | BTW |
-| Poland | 23% | VAT |
-
-## Supported Areas
-
-Finland (FI), Sweden (SE1–SE4), Norway (NO1–NO5), Denmark (DK1–DK2), Estonia (EE), Latvia (LV), Lithuania (LT), Austria (AT), Belgium (BE), Germany (DE-LU), France (FR), Netherlands (NL), Poland (PL)
-
-## Timezones
-
-| Timezone | Areas | UTC Offset |
-|----------|-------|------------|
-| EET/EEST | Finland, Estonia, Latvia, Lithuania | UTC+2 / +3 |
-| CET/CEST | Sweden, Norway, Denmark, Germany, France, etc. | UTC+1 / +2 |
-| GMT/BST | UK, Ireland, Portugal | UTC+0 / +1 |
-
-Timezone auto-updates when you change the price area. Can be overridden manually in Settings.
-
-## REST API
-
-`GET /api/prices`
+`GET /api/prices` returns the current state and all loaded prices:
 
 ```json
 {
-  "version": "0.93",
-  "build": "Mar 20 2026 12:55:17",
+  "version": "0.96",
   "area": "FI",
   "currency": "EUR",
-  "timezone": "EET-2EEST,M3.5.0/3,M10.5.0/4",
   "vatEnabled": true,
   "vatRate": 25.5,
-  "tariff": 0.41,
-  "currentPrice": 3.67,
+  "tariff": 0.50,
+  "currentPrice": 4.12,
   "unit": "c/kWh",
   "relayOpen": false,
   "charging": true,
-  "priceStop": 8.0,
-  "forceChargeStart": 2,
-  "forceChargeEnd": 7,
+  "priceStop": -1.0,
+  "forceChargeStart": -1,
+  "forceChargeEnd": -1,
   "overrideMinRemaining": 0,
+  "priceRoof": 15.0,
+  "cheapHours": 4.00,
+  "cheapStart": 22,
+  "cheapEnd": 7,
+  "cheapSlots": 16,
+  "cheapPlannedHours": 4.00,
+  "cheapPlanComplete": true,
+  "cheapAvg": 2.85,
   "priceCount": 192,
   "todayCount": 96,
   "tomorrowLoaded": true,
-  "minPrice": 1.47,
-  "maxPrice": 6.87,
-  "freeHeap": 225644,
+  "minPrice": 1.90,
+  "maxPrice": 12.40,
+  "freeHeap": 180000,
   "prices": [
-    {"time": "00:00", "price": 3.93, "tomorrow": false},
-    {"time": "00:15", "price": 3.65, "tomorrow": false},
-    ...
-    {"time": "23:45", "price": 0.19, "tomorrow": true}
+    { "time": "00:00", "price": 3.95, "tomorrow": false, "cheap": false }
   ]
 }
 ```
 
-## WiFi Behavior
+The response also includes `build` and `timezone`. A value of `-1` means "not set".
+`relayOpen: true` means charging is blocked.
 
-| State | Behavior |
-|-------|----------|
-| First boot (no WiFi saved) | Opens AP hotspot for configuration |
-| WiFi connected | Normal operation |
-| WiFi drops | Reconnects every 30 seconds |
-| WiFi disconnected > 2 min | Falls back to AP hotspot mode |
-| WiFi/mDNS changed in settings | Reboots to apply |
+## Security notes
 
-## Troubleshooting
+- The web interface has **no password**. Anyone on the same network can change settings or
+  upload firmware. Use it only on a trusted home network, and don't expose it to the internet.
+- The setup access point is open (no password) while the device is in setup mode.
+- Price data is fetched over HTTPS, but the server certificate isn't verified.
 
-**Prices not loading** — Check serial monitor. Common causes: WiFi disconnected, NTP not synced (year shows 1970), Nord Pool API temporarily unavailable. The device retries every 60 seconds.
+## Data source
 
-**"Fetching prices..." page on every load** — A price fetch is in progress (takes 5–15 seconds due to TLS). Wait for it to complete and refresh.
+Prices come from the public Nord Pool data portal API
+(`dataportal-api.nordpoolgroup.com`). It's not an official or guaranteed API, so it may change or
+be rate-limited. Nord Pool's terms of use apply to the data.
 
-**Chart shows only a few wide bars** — NTP hadn't synced when prices were fetched (wrong date). Reboot the device or wait for the next fetch cycle.
-
-**Min/Max shows "--"** — Prices haven't loaded yet. Wait for the first successful fetch.
-
-**Relay behaves backwards** — Your module may be active LOW. Swap `HIGH`/`LOW` in `updateRelay()`.
-
-**Can't access charger.local** — mDNS doesn't work on all networks/devices. Use the IP address from serial monitor or check your router's DHCP client list.
-
-**Tomorrow's prices not appearing** — Published around 14:00–14:45 CET. The device checks every 5 minutes after 14:00 local time. Verify via `/api/prices` → `tomorrowLoaded` field.
-
-**OTA update fails** — Ensure the `.bin` file is an ESP32 firmware binary (Sketch → Export Compiled Binary), not the `.ino` source file. A failed update boots back to the previous firmware.
-
-## Technical Notes
-
-### Memory Management
-
-The firmware is designed for weeks of continuous operation:
-
-- Page rendering uses `server.sendContent_P(PSTR(...))` — HTML/CSS/JS from flash, zero heap allocation
-- Price data sent entry-by-entry via chunked HTTP (80-byte stack buffer per entry)
-- JSON parsing uses ArduinoJson filter to parse only the selected delivery area (~90% memory reduction)
-- API responses read via `getString()` to handle chunked transfer encoding
-- No String concatenation in hot paths — all dynamic content uses `snprintf()` with stack buffers
-- Global state snapshots prevent race conditions during page rendering
-- Heap usage logged every 5 minutes to serial monitor
-
-### Nord Pool API
-
-Uses the free, public dataportal API:
-```
-GET https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices
-    ?date=2026-03-20&market=DayAhead&deliveryArea=FI&currency=EUR
-```
-
-- No API key or authentication required
-- Returns EUR/MWh without VAT
-- Finland uses 15-minute delivery intervals
-- HTTPS with certificate verification skipped (`setInsecure()`) for ESP32 compatibility
-
-### Pin Configuration
-
-| Pin | Function |
-|-----|----------|
-| GPIO 26 | Relay control (configurable via `RELAY_PIN`) |
-| GPIO 2 | Built-in LED (status indicator) |
-
-## Configuration
-
-Edit these `#define` values before compiling:
-
-```c
-#define FW_VERSION           "0.93"
-#define RELAY_PIN            26
-#define NTP_SERVER           "pool.ntp.org"
-#define TIMEZONE             "EET-2EEST,M3.5.0/3,M10.5.0/4"  // Default
-#define MDNS_NAME            "charger"
-#define AP_SSID              "NordPool-Charger"
-#define PRICE_FETCH_INTERVAL 900000  // 15 minutes in ms
-```
-
-All runtime settings (WiFi, area, timezone, thresholds, tariff) are stored in ESP32 flash and persist across reboots and firmware updates.
-
-## Dependencies
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| [ArduinoJson](https://arduinojson.org/) | 7.x | JSON parsing with filter support |
-| ESP32 Arduino Core | 2.x+ | WiFi, WebServer, Preferences, Update, mDNS |
-
-## License
-
-MIT
+This project isn't affiliated with Nord Pool.

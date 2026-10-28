@@ -6,15 +6,17 @@
  * - Fetches day-ahead electricity prices from Nord Pool public API
  * - Web UI with price graph (15-minute intervals for Finland, hourly for others)
  * - Configurable price thresholds for dry contact relay control
+ * - Cheapest hours mode: charge only during the N cheapest hours within a time window
+ * - Roof price: never charge above it (only manual override can)
  * - Transistor-driven dry contact (normally closed when ESP32 loses power)
  * - mDNS for easy access (http://charger.local)
  * - Multiple area support (FI, SE1-4, DK1-2, NO1-5, EE, LV, LT, etc.)
  * - Finnish 25.5% VAT automatically applied (configurable per area)
  * 
  * Hardware:
- * - ESP32 dev board
+ * - ESP32 / ESP32-S3 dev board
  * - NPN transistor (e.g., 2N2222) driving a relay
- *   - GPIO 26 -> 1kΩ resistor -> transistor base
+ *   - GPIO 14 (RELAY_PIN) -> 1kΩ resistor -> transistor base
  *   - Relay coil between VCC and transistor collector
  *   - Transistor emitter to GND
  *   - Flyback diode across relay coil
@@ -45,10 +47,10 @@
 
 // ======================== CONFIGURATION ========================
 
-#define FW_VERSION       "0.93"
+#define FW_VERSION       "0.96"
 #define FW_BUILD_DATE    __DATE__ " " __TIME__
 
-#define RELAY_PIN        26       // GPIO for transistor base
+#define RELAY_PIN        14       // GPIO for transistor base
 #define LED_PIN          2        // Built-in LED
 #define DNS_PORT         53
 #define WEB_PORT         80
@@ -116,13 +118,22 @@ String timezone = TIMEZONE;  // User-configurable timezone (POSIX format)
 String priceArea = "FI";
 String priceCurrency = "EUR";
 float priceStop = -1;     // -1 means not set (in snt/kWh incl. VAT + tariff)
+float priceRoof = -1;     // Never charge above this price (beats every rule except manual override), -1 = off
 float tariff = 0;        // Electricity company margin/transfer in c/kWh (added to spot price)
-unsigned long overrideUntil = 0;  // millis() when manual override expires, 0 = no override
+// Manual override stored as start + duration so elapsed time (millis() - start)
+// stays correct across the ~49-day millis() rollover
+unsigned long overrideStart = 0;     // millis() when manual override started
+unsigned long overrideDuration = 0;  // Override length in ms, 0 = no override
 volatile bool fetchInProgress = false;  // True during price fetch to avoid slow page renders
 int forceChargeStart = -1;  // Hour (0-23) when forced charging starts, -1 = disabled
 int forceChargeEnd = -1;    // Hour (0-23) when forced charging ends, -1 = disabled
 bool vatEnabled = true;   // Include VAT in displayed prices
 float vatRate = 25.5;     // Current VAT rate %
+
+// Cheapest hours mode
+float cheapHours = 0;     // Hours of charging to pick within the window, 0 = disabled
+int cheapStart = 22;      // Window start hour (0-23)
+int cheapEnd = 7;         // Window end hour / deadline (0-23), start == end means 24h window
 
 // Price data storage (max 192 entries: 96 today + 96 tomorrow for 15-min intervals)
 struct PriceEntry {
@@ -143,6 +154,19 @@ bool pricesLoaded = false;
 unsigned long lastPriceFetch = 0;
 bool relayOpen = false;  // true = transistor ON = relay energized = contact OPEN = charging OFF
 bool firstFetchDone = false;  // Ensures immediate fetch on boot
+unsigned long priceDataVersion = 0;  // Bumped after every fetch, tells the cheap plan to recompute
+
+// Cheapest hours plan for the current/upcoming window
+// Stored as slot start epochs (not indices) so it survives the midnight price reset
+long cheapSlots[96];          // Start epochs of selected slots (24h of 15-min slots max)
+int cheapSlotCount = 0;
+time_t cheapWindowStart = 0;
+time_t cheapWindowEnd = 0;
+bool cheapPlanComplete = false;  // true when every slot in the window had a known price
+bool cheapPlanDirty = true;      // Settings changed -> recompute
+unsigned long cheapPlanVersion = 0;  // priceDataVersion the plan was computed from
+float cheapPlanAvg = 0;          // Average display price of selected slots
+float cheapPlanHours = 0;        // Hours actually planned (less than requested if roof/window too tight)
 
 // State machine
 enum DeviceState {
@@ -172,6 +196,11 @@ void fetchPrices();
 void fetchPricesForDate(WiFiClientSecure &client, const char* dateStr, bool filterTomorrow);
 void parsePricesFromBuffer(const char* jsonBuf, size_t jsonLen, bool filterTomorrow);
 void updateRelay();
+void updateCheapPlan();
+bool inCheapSlotNow();
+long getSlotSeconds();
+int findCurrentSlot();
+void applyChargeArgs();
 void handleRoot();
 void handleSave();
 void handleSettings();
@@ -211,11 +240,15 @@ void setup() {
   priceArea = prefs.getString("area", "FI");
   priceCurrency = prefs.getString("currency", "EUR");
   priceStop = prefs.getFloat("priceStop", -1);
+  priceRoof = prefs.getFloat("priceRoof", -1);
   tariff = prefs.getFloat("tariff", 0);
   forceChargeStart = prefs.getInt("fcStart", -1);
   forceChargeEnd = prefs.getInt("fcEnd", -1);
   vatEnabled = prefs.getBool("vatEnabled", true);
-  
+  cheapHours = prefs.getFloat("chHours", 0);
+  cheapStart = prefs.getInt("chStart", 22);
+  cheapEnd = prefs.getInt("chEnd", 7);
+
   // Set VAT rate based on area
   vatRate = getVATRate(priceArea);
   
@@ -550,6 +583,7 @@ void fetchPrices() {
     }
     // pricesLoaded stays as-is, will retry in 60s
   }
+  priceDataVersion++;
   fetchInProgress = false;
 }
 
@@ -726,36 +760,28 @@ void parsePricesFromBuffer(const char* jsonBuf, size_t jsonLen, bool filterTomor
   Serial.printf("  Added %d entries (total: %d, heap: %u)\n", addedCount, priceCount, ESP.getFreeHeap());
 }
 
+// Index of the price slot containing the current time, -1 if not in data.
+// Matches on epoch, not "HH:MM", so today's 23:45 isn't confused with tomorrow's.
+int findCurrentSlot() {
+  time_t now;
+  time(&now);
+  long slotSecs = getSlotSeconds();
+  for (int i = 0; i < priceCount; i++) {
+    if (now >= prices[i].startEpoch && now < prices[i].startEpoch + slotSecs) return i;
+  }
+  return -1;
+}
+
 void updateCurrentPrice() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
-  
-  int currentHour = timeinfo.tm_hour;
-  int currentMin = timeinfo.tm_min;
-  int currentMins = currentHour * 60 + currentMin;
-  
-  // Find the price entry matching current time
-  for (int i = 0; i < priceCount; i++) {
-    int entryHour = 0, entryMin = 0;
-    sscanf(prices[i].timeStr, "%d:%d", &entryHour, &entryMin);
-    
-    int nextHour = 0, nextMin = 0;
-    if (i + 1 < priceCount) {
-      sscanf(prices[i + 1].timeStr, "%d:%d", &nextHour, &nextMin);
-    } else {
-      nextHour = 24;
-      nextMin = 0;
-    }
-    
-    int entryMins = entryHour * 60 + entryMin;
-    int nextMins = nextHour * 60 + nextMin;
-    
-    if (currentMins >= entryMins && currentMins < nextMins) {
-      currentPriceDisplay = rawToDisplay(prices[i].priceRaw);
-      return;
-    }
+
+  int i = findCurrentSlot();
+  if (i >= 0) {
+    currentPriceDisplay = rawToDisplay(prices[i].priceRaw);
+    return;
   }
-  
+
   // If not found, use first entry
   if (priceCount > 0) {
     currentPriceDisplay = rawToDisplay(prices[0].priceRaw);
@@ -764,16 +790,23 @@ void updateCurrentPrice() {
 
 // ======================== RELAY CONTROL ========================
 
+// Remaining manual override time in ms, 0 = no override or expired
+unsigned long overrideRemainingMs() {
+  if (overrideDuration == 0) return 0;
+  unsigned long elapsed = millis() - overrideStart;  // Rollover-safe unsigned subtraction
+  return elapsed < overrideDuration ? overrideDuration - elapsed : 0;
+}
+
 void updateRelay() {
   // Manual override has highest priority
-  if (overrideUntil > 0) {
-    if (millis() < overrideUntil) {
+  if (overrideDuration > 0) {
+    if (overrideRemainingMs() > 0) {
       digitalWrite(RELAY_PIN, LOW);
       relayOpen = false;
       return;
     } else {
       // Override expired
-      overrideUntil = 0;
+      overrideDuration = 0;
       Serial.println("Manual override expired");
     }
   }
@@ -786,7 +819,8 @@ void updateRelay() {
   }
   
   updateCurrentPrice();
-  
+  updateCheapPlan();  // Keep plan fresh for the chart even during the forced window
+
   // Check if we're in the forced charge time window
   bool inForceWindow = false;
   if (forceChargeStart >= 0 && forceChargeEnd >= 0) {
@@ -804,16 +838,24 @@ void updateRelay() {
   }
   
   bool shouldCharge = true;
-  
+
   if (inForceWindow) {
     // Force charging ON regardless of price
     shouldCharge = true;
+  } else if (cheapHours > 0) {
+    // Cheapest hours mode: charge in selected slots, or whenever price is below max price
+    shouldCharge = inCheapSlotNow() || (priceStop >= 0 && currentPriceDisplay <= priceStop);
   } else if (priceStop >= 0) {
     // Normal price-based logic
-    shouldCharge = (currentPriceDisplay <= priceStop + 0.005);
+    shouldCharge = (currentPriceDisplay <= priceStop);
   }
   // If neither force window active nor threshold set: always charge
-  
+
+  // Roof price beats all automatic rules (manual override returned earlier)
+  if (priceRoof >= 0 && currentPriceDisplay > priceRoof) {
+    shouldCharge = false;
+  }
+
   if (shouldCharge) {
     digitalWrite(RELAY_PIN, LOW);
     relayOpen = false;
@@ -821,6 +863,150 @@ void updateRelay() {
     digitalWrite(RELAY_PIN, HIGH);
     relayOpen = true;
   }
+}
+
+// ======================== CHEAPEST HOURS PLAN ========================
+
+// Slot length in seconds (900 for 15-min prices, 3600 for hourly)
+long getSlotSeconds() {
+  long best = 3600;
+  for (int i = 1; i < priceCount; i++) {
+    long d = prices[i].startEpoch - prices[i - 1].startEpoch;
+    if (d > 0 && d < best) best = d;
+  }
+  return best;
+}
+
+// Window that ends at the next occurrence of cheapEnd:00 local time
+void getCheapWindow(time_t now, time_t &wStart, time_t &wEnd) {
+  struct tm t;
+  localtime_r(&now, &t);
+  t.tm_hour = cheapEnd;
+  t.tm_min = 0;
+  t.tm_sec = 0;
+  t.tm_isdst = -1;
+  wEnd = mktime(&t);
+  if (wEnd <= now) {
+    localtime_r(&now, &t);
+    t.tm_mday += 1;
+    t.tm_hour = cheapEnd;
+    t.tm_min = 0;
+    t.tm_sec = 0;
+    t.tm_isdst = -1;
+    wEnd = mktime(&t);
+  }
+
+  int windowHours = (cheapEnd - cheapStart + 24) % 24;
+  if (windowHours == 0) windowHours = 24;
+  struct tm s;
+  localtime_r(&wEnd, &s);
+  s.tm_hour -= windowHours;  // mktime normalizes negative hours to previous day
+  s.tm_isdst = -1;
+  wStart = mktime(&s);
+}
+
+// Pick the cheapest slots in the window. Recomputes when the window moves, settings
+// change, or new prices arrive while the window was still missing prices.
+// Slots that have already ended are skipped, so a reboot mid-window plans the
+// full hours from now on (errs towards charging more, not less).
+void updateCheapPlan() {
+  if (cheapHours <= 0) {
+    cheapSlotCount = 0;
+    return;
+  }
+  if (!pricesLoaded || priceCount == 0) return;
+
+  time_t now;
+  time(&now);
+  time_t wStart, wEnd;
+  getCheapWindow(now, wStart, wEnd);
+
+  if (!cheapPlanDirty && wEnd == cheapWindowEnd &&
+      (cheapPlanComplete || cheapPlanVersion == priceDataVersion)) {
+    return;
+  }
+
+  long slotSecs = getSlotSeconds();
+  long needSecs = (long)(cheapHours * 3600.0f + 0.5f);
+
+  long coveredSecs = 0;
+  for (int i = 0; i < priceCount; i++) {
+    if (prices[i].startEpoch >= wStart && prices[i].startEpoch < wEnd) coveredSecs += slotSecs;
+  }
+
+  bool used[192] = {false};
+  long selectedSecs = 0;
+  float sum = 0;
+  cheapSlotCount = 0;
+  while (selectedSecs < needSecs && cheapSlotCount < 96) {
+    int best = -1;
+    for (int i = 0; i < priceCount; i++) {
+      long s = prices[i].startEpoch;
+      if (used[i] || s < wStart || s >= wEnd || s + slotSecs <= now) continue;
+      if (priceRoof >= 0 && rawToDisplay(prices[i].priceRaw) > priceRoof) continue;
+      if (best < 0 || prices[i].priceRaw < prices[best].priceRaw) best = i;
+    }
+    if (best < 0) break;  // Fewer known slots (under roof) than requested hours
+    used[best] = true;
+    cheapSlots[cheapSlotCount++] = prices[best].startEpoch;
+    selectedSecs += slotSecs;
+    sum += rawToDisplay(prices[best].priceRaw);
+  }
+
+  cheapPlanAvg = cheapSlotCount > 0 ? sum / cheapSlotCount : 0;
+  cheapPlanHours = selectedSecs / 3600.0f;
+  cheapPlanComplete = coveredSecs >= (long)(wEnd - wStart);
+  cheapWindowStart = wStart;
+  cheapWindowEnd = wEnd;
+  cheapPlanVersion = priceDataVersion;
+  cheapPlanDirty = false;
+
+  Serial.printf("Cheap plan: %d slots (%.2fh of %.2fh), avg %.2f, window %s\n",
+                cheapSlotCount, selectedSecs / 3600.0f, cheapHours, cheapPlanAvg,
+                cheapPlanComplete ? "complete" : "missing prices");
+}
+
+bool isCheapSlot(long startEpoch) {
+  for (int i = 0; i < cheapSlotCount; i++) {
+    if (cheapSlots[i] == startEpoch) return true;
+  }
+  return false;
+}
+
+// True if the current slot is selected. Unknown current price = true
+// (fail-safe: charge, same as when no prices are loaded)
+bool inCheapSlotNow() {
+  int i = findCurrentSlot();
+  return i < 0 || isCheapSlot(prices[i].startEpoch);
+}
+
+// Parse roof price + cheapest hours fields (shared by dashboard quick form and settings page)
+void applyChargeArgs() {
+  String roofVal = server.arg("price_roof");
+  String hoursVal = server.arg("cheap_hours");
+  String startVal = server.arg("cheap_start");
+  String endVal = server.arg("cheap_end");
+
+  priceRoof = roofVal.length() > 0 ? roofVal.toFloat() : -1;
+  prefs.putFloat("priceRoof", priceRoof);
+
+  float h = hoursVal.length() > 0 ? hoursVal.toFloat() : 0;
+  if (h < 0) h = 0;
+  if (h > 24) h = 24;
+  cheapHours = h;
+  prefs.putFloat("chHours", cheapHours);
+
+  if (startVal.length() > 0) {
+    cheapStart = constrain(startVal.toInt(), 0, 23);
+    prefs.putInt("chStart", cheapStart);
+  }
+  if (endVal.length() > 0) {
+    cheapEnd = constrain(endVal.toInt(), 0, 23);
+    prefs.putInt("chEnd", cheapEnd);
+  }
+
+  cheapPlanDirty = true;
+  updateCheapPlan();  // So the redirected dashboard already shows the new plan
 }
 
 // ======================== WEB HANDLERS - AP MODE ========================
@@ -921,7 +1107,9 @@ void handleSaveQuick() {
     prefs.putInt("fcStart", -1);
     prefs.putInt("fcEnd", -1);
   }
-  
+
+  applyChargeArgs();
+
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "Redirecting...");
 }
@@ -930,12 +1118,13 @@ void handleOverride() {
   String durationVal = server.arg("duration");
   
   if (durationVal == "0" || durationVal == "cancel") {
-    overrideUntil = 0;
+    overrideDuration = 0;
     Serial.println("Manual override cancelled");
   } else if (durationVal.length() > 0) {
     int minutes = durationVal.toInt();
     if (minutes > 0 && minutes <= 1440) {  // Max 24 hours
-      overrideUntil = millis() + (unsigned long)minutes * 60000UL;
+      overrideStart = millis();
+      overrideDuration = (unsigned long)minutes * 60000UL;
       Serial.printf("Manual override: charging ON for %d minutes\n", minutes);
     }
   }
@@ -1018,7 +1207,9 @@ void handleSaveSettings() {
     tariff = 0;
   }
   prefs.putFloat("tariff", tariff);
-  
+
+  applyChargeArgs();
+
   // mDNS name change
   bool needReboot = false;
   if (newMdns.length() > 0 && newMdns != mdnsName) {
@@ -1347,6 +1538,7 @@ void sendMainPageChunked() {
   float snapMinPrice = minPriceDisplay;
   float snapMaxPrice = maxPriceDisplay;
   float snapPriceStop = priceStop;
+  float snapPriceRoof = priceRoof;
   float snapTariff = tariff;
   int snapFcStart = forceChargeStart;
   int snapFcEnd = forceChargeEnd;
@@ -1355,10 +1547,17 @@ void sendMainPageChunked() {
   bool snapTomorrowLoaded = tomorrowLoaded;
   bool snapVatEnabled = vatEnabled;
   float snapVatRate = vatRate;
-  unsigned long snapOverrideUntil = overrideUntil;
+  float snapCheapHours = cheapHours;
+  int snapCheapStart = cheapStart;
+  int snapCheapEnd = cheapEnd;
+  int snapCheapCount = cheapSlotCount;
+  bool snapCheapComplete = cheapPlanComplete;
+  float snapCheapAvg = cheapPlanAvg;
+  float snapCheapPlanned = cheapPlanHours;
+  unsigned long snapOverrideMs = overrideRemainingMs();
   int overrideRemainMin = 0;
-  if (snapOverrideUntil > 0 && millis() < snapOverrideUntil) {
-    overrideRemainMin = (int)((snapOverrideUntil - millis()) / 60000UL) + 1;
+  if (snapOverrideMs > 0) {
+    overrideRemainMin = (int)(snapOverrideMs / 60000UL) + 1;
   }
   
   struct tm timeinfo;
@@ -1369,9 +1568,11 @@ void sendMainPageChunked() {
   char dateStr[20];
   strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
   
-  const char* chargingStatus = !snapPricesLoaded ? "LOADING PRICES..." : 
+  bool overRoofNow = snapPriceRoof >= 0 && snapCurrentPrice > snapPriceRoof;
+  const char* chargingStatus = !snapPricesLoaded ? "LOADING PRICES..." :
                                (overrideRemainMin > 0 ? "OVERRIDE ON" :
-                               (snapRelayOpen ? "CHARGING OFF" : "CHARGING ON"));
+                               (snapRelayOpen ? (overRoofNow ? "OFF &ndash; ABOVE ROOF" : "CHARGING OFF") :
+                                "CHARGING ON"));
   const char* statusColor = !snapPricesLoaded ? "#ffa500" : 
                              (overrideRemainMin > 0 ? "#4488ff" :
                              (snapRelayOpen ? "#ff4444" : "#00d4aa"));
@@ -1488,9 +1689,23 @@ void sendMainPageChunked() {
   }
   if (snapTariff > 0) sf(" + %.2f snapTariff", snapTariff);
   sf(" | %s", unitLabel);
-  
+  server.sendContent("</div>");
+
+  if (snapCheapHours > 0) {
+    sf("<div class=\"vat-note\" style=\"color:#00d4aa\">&#128176; Cheapest %gh in %02d:00&ndash;%02d:00",
+       snapCheapHours, snapCheapStart, snapCheapEnd);
+    if (snapPricesLoaded && snapCheapCount > 0) sf(" &middot; avg %.2f %s", snapCheapAvg, unitLabel);
+    if (snapPricesLoaded && !snapCheapComplete) {
+      server.sendContent(" &middot; <span style=\"color:#ffa500\">waiting for next-day prices</span>");
+    } else if (snapPricesLoaded && snapCheapPlanned + 0.01f < snapCheapHours) {
+      sf(" &middot; <span style=\"color:#ffa500\">only %gh %s</span>", snapCheapPlanned,
+         snapPriceRoof >= 0 ? "below roof" : "left in window");
+    }
+    server.sendContent("</div>");
+  }
+
   server.sendContent_P(PSTR(
-    "</div></div>"
+    "</div>"
     "<div class=\"chart-card\"><div class=\"chart-title\">&#128200; Electricity Prices ("
   ));
   
@@ -1577,6 +1792,39 @@ void sendMainPageChunked() {
   
   server.sendContent_P(PSTR(
     "</select></div></div></div>"
+    "<div class=\"ctrl-row\" style=\"margin-top:10px\">"
+    "<div class=\"ctrl-item\"><label>Cheapest hours</label>"
+    "<input type=\"number\" name=\"cheap_hours\" step=\"0.25\" min=\"0\" max=\"24\" placeholder=\"Off\""
+  ));
+
+  if (snapCheapHours > 0) sf(" value=\"%g\"", snapCheapHours);
+
+  server.sendContent_P(PSTR(
+    "></div><div class=\"ctrl-item\"><label>Within window</label>"
+    "<div class=\"fc-row\"><select name=\"cheap_start\">"
+  ));
+
+  for (int h = 0; h < 24; h++) {
+    sf("<option value=\"%d\"%s>%02d</option>", h, (snapCheapStart==h)?" selected":"", h);
+  }
+
+  server.sendContent_P(PSTR("</select><span>-</span><select name=\"cheap_end\">"));
+
+  for (int h = 0; h < 24; h++) {
+    sf("<option value=\"%d\"%s>%02d</option>", h, (snapCheapEnd==h)?" selected":"", h);
+  }
+
+  server.sendContent_P(PSTR(
+    "</select></div></div></div>"
+    "<div class=\"ctrl-row\" style=\"margin-top:10px\">"
+    "<div class=\"ctrl-item\"><label>Never charge above ("
+  ));
+
+  sf("%s)</label><input type=\"number\" name=\"price_roof\" step=\"0.1\" min=\"-10\" max=\"200\" placeholder=\"Off\"", unitLabel);
+  if (snapPriceRoof >= 0) sf(" value=\"%.1f\"", snapPriceRoof);
+
+  server.sendContent_P(PSTR(
+    "></div><div class=\"ctrl-item\"></div></div>"
     "<button type=\"submit\" class=\"btn-save\">Save</button>"
     "</div></form>"
     "<div class=\"links\"><a href=\"/settings\">&#9881; Settings</a>"
@@ -1587,15 +1835,18 @@ void sendMainPageChunked() {
   // --- Price data: sent entry by entry, zero allocation ---
   for (int i = 0; i < snapPriceCount; i++) {
     float displayP = rawToDisplay(prices[i].priceRaw);
-    char entry[80];
-    snprintf(entry, sizeof(entry), "%s{\"t\":\"%s\",\"p\":%.2f,\"tm\":%d}",
-             i > 0 ? "," : "", prices[i].timeStr, displayP, prices[i].isTomorrow ? 1 : 0);
+    char entry[96];
+    snprintf(entry, sizeof(entry), "%s{\"t\":\"%s\",\"p\":%.2f,\"tm\":%d,\"c\":%d}",
+             i > 0 ? "," : "", prices[i].timeStr, displayP, prices[i].isTomorrow ? 1 : 0,
+             isCheapSlot(prices[i].startEpoch) ? 1 : 0);
     server.sendContent(entry);
   }
   
   // --- JS config variables ---
-  sf("];const todayCount=%d;const thresholdStop=%.2f;const fcStart=%d;const fcEnd=%d;const unit='%s';",
-     snapTodayCount, snapPriceStop, snapFcStart, snapFcEnd, unitLabel);
+  sf("];const todayCount=%d;const thresholdStop=%.2f;const fcStart=%d;const fcEnd=%d;const unit='%s';"
+     "const cheapMode=%d;const roofPrice=%.2f;",
+     snapTodayCount, snapPriceStop, snapFcStart, snapFcEnd, unitLabel, snapCheapHours > 0 ? 1 : 0,
+     snapPriceRoof);
   
   // --- PART 3: Chart JS (static, stored in flash) ---
   server.sendContent_P(PSTR(
@@ -1637,6 +1888,13 @@ void sendMainPageChunked() {
     "ctx.beginPath();ctx.moveTo(pad.left,y);ctx.lineTo(pad.left+chartW,y);ctx.stroke();"
     "ctx.setLineDash([]);ctx.fillStyle='#ff6644';ctx.font='bold 10px sans-serif';"
     "ctx.textAlign='left';ctx.fillText('Stop '+thresholdStop.toFixed(1),pad.left+4,y-4);}}"
+    "if(roofPrice>=0){"
+    "const y=pad.top+chartH-((roofPrice-yMin)/yRange)*chartH;"
+    "if(y>=pad.top&&y<=pad.top+chartH){"
+    "ctx.strokeStyle='#ffa500';ctx.lineWidth=1.5;ctx.setLineDash([2,2]);"
+    "ctx.beginPath();ctx.moveTo(pad.left,y);ctx.lineTo(pad.left+chartW,y);ctx.stroke();"
+    "ctx.setLineDash([]);ctx.fillStyle='#ffa500';ctx.font='bold 10px sans-serif';"
+    "ctx.textAlign='right';ctx.fillText('Roof '+roofPrice.toFixed(1),pad.left+chartW-4,y-4);}}"
     "if(todayCount>0&&todayCount<prices.length){"
     "const sepX=pad.left+todayCount*(chartW/prices.length);"
     "ctx.strokeStyle='#00d4aa';ctx.lineWidth=1.5;ctx.setLineDash([3,3]);"
@@ -1658,11 +1916,15 @@ void sendMainPageChunked() {
     "else{inFC=(pH>=fcStart||pH<fcEnd);}}"
     "let wouldCharge=true;"
     "if(inFC){wouldCharge=true;}"
+    "else if(cheapMode){wouldCharge=!!p.c||(thresholdStop>=0&&p.p<=thresholdStop);}"
     "else if(thresholdStop>=0){wouldCharge=p.p<=thresholdStop;}"
+    "const overRoof=roofPrice>=0&&p.p>roofPrice;"
+    "if(overRoof){wouldCharge=false;inFC=false;}"
     "let color=wouldCharge?'#00d4aa':'#ff4444';"
     "if(inFC&&!wouldCharge)color='#4488ff';"
     "if(inFC&&wouldCharge&&thresholdStop>=0)color='#4488ff';"
     "if(p.tm){if(inFC)color='#3366cc';else color=wouldCharge?'#00a088':'#cc3333';}"
+    "if(overRoof)color=p.tm?'#772233':'#992233';"
     "const parts=p.t.split(':'),pMins=parseInt(parts[0])*60+parseInt(parts[1]);"
     "let nextMins=1440;"
     "if(i+1<prices.length){"
@@ -1679,7 +1941,7 @@ void sendMainPageChunked() {
     "const nH=((0-p.p)/yRange)*chartH;"
     "ctx.fillStyle=color;ctx.fillRect(x,zY,barW,nH);}"
     "barRects.push({x:x,y:Math.min(y,pad.top+chartH),w:barW,h:Math.abs(barH),"
-    "time:p.t,price:p.p,tomorrow:p.tm,charge:wouldCharge,current:isCurrent,forced:inFC,"
+    "time:p.t,price:p.p,tomorrow:p.tm,charge:wouldCharge,current:isCurrent,forced:inFC,cheap:!!p.c,roof:overRoof,"
     "hitX:x,hitY:pad.top,hitW:totalBarW,hitH:chartH});});"
   ));
   
@@ -1716,12 +1978,13 @@ void sendMainPageChunked() {
     "document.getElementById('tipTime').textContent=found.time+' - '+nextTime+dayLabel;"
     "document.getElementById('tipPrice').textContent=found.price.toFixed(2)+' '+unit;"
     "let st;"
-    "if(found.current){st=found.forced?'\\u25ba Current (forced ON)':'\\u25ba Current period';}"
+    "if(found.roof){st=found.current?'\\u25ba Current (above roof)':'\\u26d4 Above roof price';}"
+    "else if(found.current){st=found.forced?'\\u25ba Current (forced ON)':'\\u25ba Current period';}"
     "else if(found.forced){st='\\u26a1 Always charge window';}"
-    "else{st=found.charge?'\\u25cf Charging ON':'\\u25cb Charging OFF';}"
+    "else{st=found.charge?(found.cheap?'\\u25cf Charging (cheapest)':'\\u25cf Charging ON'):'\\u25cb Charging OFF';}"
     "const se=document.getElementById('tipStatus');"
-    "se.textContent=found.tomorrow?(found.forced?'\\u26a1 Always charge window':"
-    "(found.charge?'\\u25cf Would charge':'\\u25cb Would stop')):st;"
+    "se.textContent=found.tomorrow?(found.roof?'\\u26d4 Above roof price':found.forced?'\\u26a1 Always charge window':"
+    "(found.charge?(found.cheap?'\\u25cf Would charge (cheapest)':'\\u25cf Would charge'):'\\u25cb Would stop')):st;"
     "se.style.color=found.forced?'#4488ff':(found.current?'#ffffff':"
     "(found.charge?'#00d4aa':'#ff4444'));"
     "let tx=found.hitX+found.hitW/2,ty=found.hitY-5;"
@@ -1911,9 +2174,19 @@ void sendSettingsPageChunked() {
   ));
   
   if (priceStop >= 0) sf(" value=\"%.1f\"", priceStop);
-  
+
   server.sendContent_P(PSTR(
-    "><div class=\"hint\">Relay opens (charging stops) when current price is above this value</div></div>"
+    "><div class=\"hint\">Relay opens (charging stops) when current price is above this value</div>"
+    "<label>Never charge above (roof price)</label>"
+    "<input type=\"number\" name=\"price_roof\" step=\"0.1\" min=\"-10\" max=\"200\" "
+    "placeholder=\"Leave empty = no roof\""
+  ));
+
+  if (priceRoof >= 0) sf(" value=\"%.1f\"", priceRoof);
+
+  server.sendContent_P(PSTR(
+    "><div class=\"hint\">Hard limit: blocks charging above this price, also during always allowed hours "
+    "and cheapest hours. Only the manual override can charge above it.</div></div>"
     "<div class=\"card\"><h3>&#128337; Always Allowed Charging Hours</h3>"
     "<p style=\"color:#aaa;font-size:0.85em;margin-bottom:12px\">"
     "During this window charging is always ON, even if price exceeds the threshold.</p>"
@@ -1935,10 +2208,42 @@ void sendSettingsPageChunked() {
   server.sendContent_P(PSTR(
     "</select></div>"
     "<div class=\"hint\">Example: 23:00 &#8594; 07:00 = always charge overnight. Both Off = disabled.</div></div>"
+    "<div class=\"card\"><h3>&#128176; Cheapest Hours</h3>"
+    "<p style=\"color:#aaa;font-size:0.85em;margin-bottom:12px\">"
+    "Charge only during the cheapest hours within a time window, e.g. 4 cheapest hours between 22:00 and 07:00.</p>"
+    "<label>Hours to charge</label>"
+    "<input type=\"number\" name=\"cheap_hours\" step=\"0.25\" min=\"0\" max=\"24\" placeholder=\"Leave empty = off\""
+  ));
+
+  if (cheapHours > 0) sf(" value=\"%g\"", cheapHours);
+
+  server.sendContent_P(PSTR(
+    "><label>Window</label><div class=\"fc-row\"><select name=\"cheap_start\">"
+  ));
+
+  for (int h = 0; h < 24; h++) {
+    sf("<option value=\"%d\"%s>%02d:00</option>", h, (cheapStart==h)?" selected":"", h);
+  }
+
+  server.sendContent_P(PSTR("</select><span>&#8594;</span><select name=\"cheap_end\">"));
+
+  for (int h = 0; h < 24; h++) {
+    sf("<option value=\"%d\"%s>%02d:00</option>", h, (cheapEnd==h)?" selected":"", h);
+  }
+
+  server.sendContent_P(PSTR(
+    "</select></div>"
+    "<div class=\"hint\">Same start and end = 24h window. Start the window after next-day prices are "
+    "published (~14:00 CET) so the whole window is known when planning.</div></div>"
     "<div class=\"card\"><div class=\"info-box\">"
     "<strong>How charging logic works:</strong><br><br>"
     "&#8226; <strong>Max price set:</strong> Charges when price &#8804; max, stops when above<br>"
+    "&#8226; <strong>Cheapest hours set:</strong> Charges only in the cheapest slots of the window. "
+    "If max price is also set, charges additionally whenever price &#8804; max<br>"
     "&#8226; <strong>Always allowed hours:</strong> Overrides max price &#8212; charges regardless during this window<br>"
+    "&#8226; <strong>Roof price set:</strong> Never charges above it, whatever the other rules say. "
+    "Cheapest hours skips slots above the roof, so you may get fewer hours than requested<br>"
+    "&#8226; <strong>Manual override:</strong> Always charges, even above the roof<br>"
     "&#8226; <strong>Nothing set:</strong> Always charges<br><br>"
     "<strong>Relay wiring:</strong> Use COM + NC (Normally Closed) terminals. "
     "If ESP32 loses power, relay de-energizes and NC closes = charging stays ON.<br><br>"
@@ -1981,8 +2286,9 @@ void sendSettingsPageChunked() {
 
 void sendApiJsonChunked() {
   int ovRemain = 0;
-  if (overrideUntil > 0 && millis() < overrideUntil) {
-    ovRemain = (int)((overrideUntil - millis()) / 60000UL) + 1;
+  unsigned long ovMs = overrideRemainingMs();
+  if (ovMs > 0) {
+    ovRemain = (int)(ovMs / 60000UL) + 1;
   }
   sf("{\"version\":\"%s\",\"build\":\"%s\",\"area\":\"%s\",\"currency\":\"%s\",\"timezone\":\"%s\",\"vatEnabled\":%s,\"vatRate\":%.1f,\"tariff\":%.2f,",
      FW_VERSION, FW_BUILD_DATE, priceArea.c_str(), priceCurrency.c_str(), timezone.c_str(),
@@ -1992,6 +2298,10 @@ void sendApiJsonChunked() {
   sf("\"priceStop\":%.1f,\"forceChargeStart\":%d,\"forceChargeEnd\":%d,"
      "\"overrideMinRemaining\":%d,",
      priceStop, forceChargeStart, forceChargeEnd, ovRemain);
+  sf("\"priceRoof\":%.1f,\"cheapHours\":%.2f,\"cheapStart\":%d,\"cheapEnd\":%d,\"cheapSlots\":%d,"
+     "\"cheapPlannedHours\":%.2f,\"cheapPlanComplete\":%s,\"cheapAvg\":%.2f,",
+     priceRoof, cheapHours, cheapStart, cheapEnd, cheapSlotCount, cheapPlanHours,
+     cheapPlanComplete ? "true" : "false", cheapPlanAvg);
   sf("\"priceCount\":%d,\"todayCount\":%d,\"tomorrowLoaded\":%s,"
      "\"minPrice\":%.2f,\"maxPrice\":%.2f,\"freeHeap\":%u,\"prices\":[",
      priceCount, todayCount, tomorrowLoaded ? "true" : "false",
@@ -2000,9 +2310,10 @@ void sendApiJsonChunked() {
   for (int i = 0; i < priceCount; i++) {
     float dp = rawToDisplay(prices[i].priceRaw);
     char entry[96];
-    snprintf(entry, sizeof(entry), "%s{\"time\":\"%s\",\"price\":%.2f,\"tomorrow\":%s}",
-             i > 0 ? "," : "", prices[i].timeStr, dp, 
-             prices[i].isTomorrow ? "true" : "false");
+    snprintf(entry, sizeof(entry), "%s{\"time\":\"%s\",\"price\":%.2f,\"tomorrow\":%s,\"cheap\":%s}",
+             i > 0 ? "," : "", prices[i].timeStr, dp,
+             prices[i].isTomorrow ? "true" : "false",
+             isCheapSlot(prices[i].startEpoch) ? "true" : "false");
     server.sendContent(entry);
   }
   
